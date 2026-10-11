@@ -113,3 +113,10 @@ run.sh           一键启动
 ## 技术栈
 
 Python 3 · FastAPI · Uvicorn · WebSocket · SQLite · Streamlit · Pydantic
+
+## 更多文档
+
+- 架构与数据流（含流程图）：[docs/architecture.md](docs/architecture.md)
+- 环境变量示例：[.env.example](.env.example)
+- 许可证：[MIT](LICENSE)
+
