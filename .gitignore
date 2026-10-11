@@ -1,0 +1,22 @@
+# 运行时本地数据（SQLite、项目文件、归档）——不入库
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Streamlit 本地密钥
+.streamlit/secrets.toml
+
+# 日志
+*.log
