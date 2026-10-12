@@ -16,6 +16,8 @@ API_BASE = os.environ.get("WORKBENCH_API", f"http://127.0.0.1:{PORT}")
 
 # 可选访问密码（空表示不校验）
 ACCESS_PASSWORD = os.environ.get("WORKBENCH_PASSWORD", "")
+# 是否开启访问认证：配置了密码即为 True（由 WORKBENCH_PASSWORD 派生）
+AUTH_REQUIRED = bool(ACCESS_PASSWORD)
 
 # 进度节流：默认 500ms 一次，避免前端频繁重绘
 PROGRESS_THROTTLE_MS = int(os.environ.get("PROGRESS_THROTTLE_MS", "500"))

@@ -9,17 +9,22 @@ import queue
 import threading
 import time
 from typing import Dict, Optional, Tuple
+from urllib.parse import quote
 
 from backend import config
 
-# (session_id, project) -> WSClient
-_clients: Dict[Tuple[str, str], "WSClient"] = {}
+from . import api
+
+# (session_id, project, token) -> WSClient
+_clients: Dict[Tuple[str, str, str], "WSClient"] = {}
 _lock = threading.Lock()
 
 
 class WSClient:
-    def __init__(self, project: str) -> None:
+    def __init__(self, project: str, token: Optional[str] = None) -> None:
         self.project = project
+        # 连接所用令牌；令牌变更后由 get_client 用新 key 建立新连接
+        self.token = token or None
         self.queue: "queue.Queue[dict]" = queue.Queue()
         self._stop = False
         self.connected = False
@@ -31,7 +36,10 @@ class WSClient:
 
     def _url(self) -> str:
         base = config.API_BASE.replace("http://", "ws://").replace("https://", "wss://")
-        return f"{base}/ws/{self.project}"
+        url = f"{base}/ws/{self.project}"
+        if self.token:
+            url += f"?token={quote(self.token)}"
+        return url
 
     def _run(self) -> None:
         from websockets.sync.client import connect
@@ -85,11 +93,20 @@ class WSClient:
 
 
 def get_client(session_id: str, project: str) -> WSClient:
-    key = (session_id, project)
+    """获取（或创建）指定会话+项目的 WebSocket 客户端。
+
+    缓存 key 包含当前令牌，令牌变更后会新建连接，避免复用旧鉴权连接。
+    参数：
+        session_id: Streamlit 会话 ID。
+        project: 项目名称。
+    返回值：对应 WSClient 实例。
+    """
+    token = api.get_token() or ""
+    key = (session_id, project, token)
     with _lock:
         client = _clients.get(key)
         if client is None:
-            client = WSClient(project)
+            client = WSClient(project, token)
             client.start()
             _clients[key] = client
         return client

@@ -20,11 +20,22 @@ def project_dir(name: str) -> Path:
     return config.PROJECTS_DIR / name
 
 
+def imports_dir(name: str) -> Path:
+    """返回项目的导入目录（与 public/private 并列的 imports/）。
+
+    功能：定位项目下的 imports/ 子目录，用于存放本地导出的聊天记录文件。
+    参数：name —— 项目名。
+    返回值：imports 目录的 Path 对象（不保证已存在）。
+    """
+    return project_dir(name) / "imports"
+
+
 def create_project(name: str) -> dict:
     name = _safe_name(name)
     root = project_dir(name)
     (root / "public").mkdir(parents=True, exist_ok=True)
     (root / "private").mkdir(parents=True, exist_ok=True)
+    (root / "imports").mkdir(parents=True, exist_ok=True)
     return {"name": name, "path": str(root)}
 
 
@@ -43,6 +54,7 @@ def ensure_project(name: str) -> dict:
         return create_project(name)
     (root / "public").mkdir(parents=True, exist_ok=True)
     (root / "private").mkdir(parents=True, exist_ok=True)
+    (root / "imports").mkdir(parents=True, exist_ok=True)
     return {"name": name, "path": str(root)}
 
 

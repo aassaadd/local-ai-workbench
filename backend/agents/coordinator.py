@@ -1,22 +1,25 @@
-"""协调员 Agent：对接本地模型做任务拆解与分发，并负责消息分级（私聊/内部群）。"""
-import asyncio
-import re
-from datetime import date as _date, timedelta
+"""协调员 Agent：对接本地模型做任务拆解与分发，并负责消息分级（私聊/内部群）。
 
-from .. import llm, memory
+路由方式：查询「能力注册表」（capabilities）选择能力并执行——
+- 有本地模型时，让模型输出 {"capability": "...", "args": {...}} 选择能力；
+- 无本地模型或模型解析失败时，按关键词打分兜底；
+- 未命中任何非 chat 能力时，回退通用对话（保留分层记忆）。
+新增能力只需在 capabilities 注册，无需改动本文件的路由逻辑。
+"""
+import json
+
+from .. import capabilities, llm, memory
 from ..models import VIS_ALL, VIS_INTERNAL
 from ..progress import TaskCancelled
-from .base import BaseAgent, say, send_file
-from .doubao import DoubaoAgent
-from .trae_agent import TraeAgent
-from .workbuddy import WorkbuddyAgent
+from .base import BaseAgent, say
 
 SYSTEM_PROMPT = """你是本地 AI 协作工作台的协调员，仅以第一人称与用户对话。
 输出规则：
 1. 给用户的最终回复、需要用户确认的问题、重要告警，属于结果类消息；
 2. 给其他 Agent 的任务指令、过程沟通、中间校验，属于过程类消息；
 3. 永远不要在私聊窗口提及其他 Agent 的存在，只以第一人称回复用户；
-4. 用户问起过程细节时，回复「可以点击顶部『内部群聊』查看完整执行过程」。"""
+4. 用户问起过程细节时，回复「可以点击顶部『内部群聊』查看完整执行过程」。
+5. 你只能选择下面已注册的能力来完成任务，不要臆造未注册的能力。"""
 
 
 class Coordinator(BaseAgent):
@@ -24,83 +27,78 @@ class Coordinator(BaseAgent):
     display = "协调员"
 
     async def handle(self, user_text: str) -> None:
+        """处理一条用户需求：拆解 → 选能力 → 执行。
+
+        功能：先广播「收到需求」提示，再路由选择能力并执行；chat 能力走通用对话。
+        参数：user_text —— 用户输入的原始文本。
+        返回值：无。
+        """
         await say(self.project, self.name, "收到需求，正在拆解任务…", VIS_ALL)
-        intent = self._detect(user_text)
         try:
-            if intent == "chat_summary":
-                await self._chat_summary(user_text)
-            elif intent == "file_ops":
-                await self._file_ops()
-            else:
+            key, args = await self._route(user_text)
+            args = dict(args or {})
+            args.setdefault("text", user_text)
+            cap = capabilities.get(key)
+            if key == "chat" or cap is None or cap.handler is None:
                 await self._chat_reply()
+                return
+            await cap.handler(self.project, args)
         except TaskCancelled:
             await say(self.project, self.name, "任务已取消。", VIS_ALL)
         except Exception as exc:  # 兜底，避免后台任务静默失败
             await say(self.project, self.name, f"处理失败：{exc}", VIS_ALL)
 
-    # ---------------- 意图识别 ----------------
-    def _detect(self, text: str) -> str:
-        if any(k in text for k in ("聊天记录", "客户意向", "意向摘要", "外部联系人")):
-            return "chat_summary"
-        if any(k in text for k in ("整理文件", "汇总文件", "文件清单", "整理项目")):
-            return "file_ops"
-        return "chat"
+    # ---------------- 能力路由 ----------------
+    async def _route(self, user_text: str) -> tuple:
+        """选择要执行的能力及其参数。
 
-    def _extract_date(self, text: str) -> str:
-        today = _date.today()
-        if "前天" in text:
-            d = today - timedelta(days=2)
-        elif "昨日" in text or "昨天" in text:
-            d = today - timedelta(days=1)
-        elif "今天" in text or "今日" in text:
-            d = today
-        elif (m := re.search(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)):
-            d = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        else:
-            d = today - timedelta(days=1)
-        return d.strftime("%Y%m%d")
+        功能：有本地模型时先让模型选能力（解析失败或能力不存在则回退关键词打分），
+              无本地模型时直接用关键词打分。
+        参数：user_text —— 用户输入文本。
+        返回值：(能力 key, args)。
+        """
+        if llm.available():
+            routed = await self._llm_route(user_text)
+            if routed and capabilities.get(routed[0]):
+                return routed
+        return capabilities.match(user_text)
 
-    # ---------------- 流程一：聊天记录 → 客户意向摘要 ----------------
-    async def _chat_summary(self, user_text: str) -> None:
-        d = self._extract_date(user_text)
+    async def _llm_route(self, user_text: str) -> tuple | None:
+        """调用本地模型选择能力。
 
-        # 过程类（仅内部群）：派发给 Workbuddy
-        await say(self.project, self.name,
-                  f"@Workbuddy 拉取 {d} 外部联系人聊天记录，请统计总数并导出到公共文件夹",
-                  VIS_INTERNAL)
-        records, src = await WorkbuddyAgent(self.project).pull_chat_records(d)
-
-        # 过程类（仅内部群）：派发给豆包
-        await say(self.project, self.name,
-                  f"@豆包 读取公共文件夹 {src.name}，生成客户意向摘要",
-                  VIS_INTERNAL)
-        res = await DoubaoAgent(self.project).generate_summary(src, d)
-
-        # 过程类（仅内部群）：校验
-        await say(self.project, self.name, "[校验完成] 结果无误，已同步给用户", VIS_INTERNAL)
-
-        # 结果类（私聊 + 内部群）
-        summary = (
-            f"已完成 {d} 聊天记录摘要，共处理 {res['total']} 条对话、{res['contacts']} 位客户。\n"
-            f"高意向 {len(res['high'])} 位，中意向 {len(res['mid'])} 位，低意向 {len(res['low'])} 位。"
+        功能：在系统提示词中列出可用能力清单，要求模型只输出 JSON。
+        参数：user_text —— 用户输入文本。
+        返回值：(能力 key, args)，无法解析时返回 None。
+        """
+        system = (
+            SYSTEM_PROMPT
+            + "\n\n" + capabilities.describe()
+            + '\n请只输出 JSON：{"capability": "能力key", "args": {...}}，'
+              "args 为传给该能力的参数（如日期 date），无参数则为 {}。"
         )
-        if res["high"]:
-            summary += f"\n高意向客户：" + "、".join(res["high"][:8])
-        await say(self.project, self.name, summary, VIS_ALL)
-        await send_file(self.project, self.name, res["file"], "public", VIS_ALL,
-                        content="完整报告：客户意向摘要.md")
-
-    # ---------------- 流程二：文件整理 ----------------
-    async def _file_ops(self) -> None:
-        await say(self.project, self.name,
-                  "@Trae 整理公共文件夹并生成文件清单", VIS_INTERNAL)
-        res = await TraeAgent(self.project).consolidate("public")
-        await say(self.project, self.name,
-                  f"已完成文件整理，共 {res['count']} 个文件，清单已输出。", VIS_ALL)
-        await send_file(self.project, self.name, res["file"], "public", VIS_ALL)
+        reply = await llm.chat([{"role": "system", "content": system},
+                                {"role": "user", "content": user_text}])
+        if not reply:
+            return None
+        try:
+            obj = json.loads(reply[reply.find("{"):reply.rfind("}") + 1])
+        except (ValueError, json.JSONDecodeError):
+            return None
+        key = obj.get("capability")
+        if not isinstance(key, str) or not key.strip():
+            return None
+        args = obj.get("args")
+        return key.strip(), args if isinstance(args, dict) else {}
 
     # ---------------- 通用问答（带分层记忆与自动压缩） ----------------
     async def _chat_reply(self) -> None:
+        """通用对话兜底：带分层记忆与自动压缩的回复。
+
+        功能：装配上下文（长期档案 + 摘要 + 近期原文），调用本地模型回复；
+              无模型时给出可用能力引导文案（保持原有文案）。
+        参数：无（使用该类实例的项目上下文）。
+        返回值：无。
+        """
         ctx = await memory.build_context(self.project, SYSTEM_PROMPT)
         s = ctx["stats"]
         notes = []
